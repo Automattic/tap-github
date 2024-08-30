@@ -57,7 +57,7 @@
       "id": {
         "type": ["null", "string"]
       },
-      "updated_at": {
+      "pr_updated_at": {
         "type": ["null", "string"],
         "format": "date-time"
       }

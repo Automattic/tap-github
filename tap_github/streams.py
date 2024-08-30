@@ -511,7 +511,7 @@ class PRFiles(IncrementalStream):
     '''
     tap_stream_id = "pr_files"
     replication_method = "INCREMENTAL"
-    replication_keys = "updated_at"
+    replication_keys = "pr_updated_at"
     key_properties = ["id"]
     path = "pulls/{}/files"
     use_repository = True
@@ -522,10 +522,9 @@ class PRFiles(IncrementalStream):
         """
         Add fields in the record explicitly at the 1st level of JSON.
         """
-        record['updated_at'] = record['commit']['committer']['date']
-
+        record['pr_updated_at'] = parent_record['updated_at']
         record['pr_number'] = parent_record.get('number')
-        record['pr_id'] = parent_record.get('id')
+        record['pr_id'] = str(parent_record.get('id'))
         record['id'] = '{}-{}'.format(parent_record.get('id'), record.get('sha'))
 
 class PullRequests(IncrementalOrderedStream):
