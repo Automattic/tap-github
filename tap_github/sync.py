@@ -30,7 +30,8 @@ def update_currently_syncing(state, stream_name):
         del state['currently_syncing']
     else:
         singer.set_currently_syncing(state, stream_name)
-    singer.write_state(state)
+    if state:
+        singer.write_state(state)
 
 def update_currently_syncing_repo(state, repo_path):
     """
@@ -41,7 +42,8 @@ def update_currently_syncing_repo(state, repo_path):
         del state['currently_syncing_repo']
     else:
         state['currently_syncing_repo'] = repo_path
-    singer.write_state(state)
+    if state:
+        singer.write_state(state)
 
 def get_ordered_stream_list(currently_syncing, streams_to_sync):
     """
@@ -184,7 +186,8 @@ def sync(client, config, state, catalog):
     repositories, organizations = client.extract_repos_from_config()
 
     state = translate_state(state, catalog, repositories)
-    singer.write_state(state)
+    if state:
+        singer.write_state(state)
 
     # Sync `teams`, `team_members`and `team_memberships` streams just single time for any organization.
     streams_to_sync_for_orgs = set(streams_to_sync).intersection(STREAM_TO_SYNC_FOR_ORGS)
@@ -231,6 +234,6 @@ def do_sync(catalog, streams_to_sync, selected_stream_ids, client, start_date, s
                                               selected_stream_ids = selected_stream_ids,
                                               stream_to_sync = streams_to_sync
                                             )
-
-            singer.write_state(state)
+            if state:
+                singer.write_state(state)
         update_currently_syncing(state, None)
