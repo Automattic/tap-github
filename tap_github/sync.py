@@ -30,8 +30,6 @@ def update_currently_syncing(state, stream_name):
         del state['currently_syncing']
     else:
         singer.set_currently_syncing(state, stream_name)
-    if state:
-        singer.write_state(state)
 
 def update_currently_syncing_repo(state, repo_path):
     """
@@ -42,8 +40,6 @@ def update_currently_syncing_repo(state, repo_path):
         del state['currently_syncing_repo']
     else:
         state['currently_syncing_repo'] = repo_path
-    if state:
-        singer.write_state(state)
 
 def get_ordered_stream_list(currently_syncing, streams_to_sync):
     """
