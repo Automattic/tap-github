@@ -169,7 +169,7 @@ def write_schemas(stream_id, catalog, selected_streams):
         write_schemas(child, catalog, selected_streams)
 
 def write_state(state):
-    if state and 'bookmarks' in state:
+    if state:
         # Only write state if it is not empty.
         singer.write_state(state)
 
