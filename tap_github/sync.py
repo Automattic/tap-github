@@ -30,6 +30,7 @@ def update_currently_syncing(state, stream_name):
         del state['currently_syncing']
     else:
         singer.set_currently_syncing(state, stream_name)
+    write_state(state)
 
 def update_currently_syncing_repo(state, repo_path):
     """
@@ -40,6 +41,7 @@ def update_currently_syncing_repo(state, repo_path):
         del state['currently_syncing_repo']
     else:
         state['currently_syncing_repo'] = repo_path
+    write_state(state)
 
 def get_ordered_stream_list(currently_syncing, streams_to_sync):
     """
@@ -166,6 +168,11 @@ def write_schemas(stream_id, catalog, selected_streams):
     for child in stream_obj.children:
         write_schemas(child, catalog, selected_streams)
 
+def write_state(state):
+    if state and 'bookmarks' in state:
+        # Only write state if it is not empty.
+        singer.write_state(state)
+
 def sync(client, config, state, catalog):
     """
     Sync selected streams.
@@ -182,8 +189,7 @@ def sync(client, config, state, catalog):
     repositories, organizations = client.extract_repos_from_config()
 
     state = translate_state(state, catalog, repositories)
-    if state:
-        singer.write_state(state)
+    write_state(state)
 
     # Sync `teams`, `team_members`and `team_memberships` streams just single time for any organization.
     streams_to_sync_for_orgs = set(streams_to_sync).intersection(STREAM_TO_SYNC_FOR_ORGS)
@@ -230,6 +236,5 @@ def do_sync(catalog, streams_to_sync, selected_stream_ids, client, start_date, s
                                               selected_stream_ids = selected_stream_ids,
                                               stream_to_sync = streams_to_sync
                                             )
-            if state:
-                singer.write_state(state)
+            write_state(state)
         update_currently_syncing(state, None)
