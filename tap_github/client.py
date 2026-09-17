@@ -16,11 +16,25 @@ DEFAULT_DOMAIN = "https://api.github.com"
 # Set default timeout of 300 seconds
 REQUEST_TIMEOUT = 300
 
-# How many total seconds to retry when getting rate limit error from API. The limit resets every hour.
-RATE_LIMIT_RETRY_MAX_TIME = 3600
+# Length of GitHub's primary rate limit window.
+RATE_LIMIT_WINDOW_SECONDS = 3600
+# How many total seconds to retry when getting rate limit error from API. The quota is shared by
+# every consumer of the GitHub account, so a fresh window can be drained again before we get to
+# it: allow waiting through a few windows before giving up.
+RATE_LIMIT_RETRY_MAX_TIME = 3 * RATE_LIMIT_WINDOW_SECONDS
 
 PAGINATION_EXCEED_MSG = 'In order to keep the API fast for everyone, pagination is limited for this resource.'
-RATE_LIMIT_EXCEED_MSG = 'API rate limit exceeded'
+# Matches both the primary ("API rate limit exceeded for ...") and the secondary
+# ("You have exceeded a secondary rate limit ...") rejection messages.
+RATE_LIMIT_MSG_FRAGMENT = 'rate limit'
+# Safety margin added on top of `X-RateLimit-Reset` so we don't wake up a few seconds early.
+RATE_LIMIT_RESET_MARGIN_SECONDS = 15
+# GitHub's guidance when no header says how long to wait: "wait for at least one minute before retrying".
+RATE_LIMIT_FALLBACK_WAIT_SECONDS = 60
+# Every rate limit related header GitHub sends. The X-RateLimit-* values are per GitHub account
+# (shared by all of its tokens), `Retry-After` only comes with secondary rate limit rejections.
+RATE_LIMIT_HEADERS = ('X-RateLimit-Limit', 'X-RateLimit-Remaining', 'X-RateLimit-Used',
+                      'X-RateLimit-Reset', 'X-RateLimit-Resource', 'Retry-After')
 
 class GithubException(Exception):
     pass
@@ -127,10 +141,14 @@ def raise_for_error(resp, source, stream, client, should_skip_404):
 
     response_message = response_json.get('message', '')
 
-    if error_code == 403 and RATE_LIMIT_EXCEED_MSG in response_message:
-        message = f"HTTP-error-code: 403, Error: {response_message}"
+    if is_rate_limit_rejection(resp, response_message):
+        message = f"HTTP-error-code: {error_code}, Error: {response_message}"
         LOGGER.warning(message)
-        raise RateLimitExceeded() from None
+        # The quota is shared by every token of the GitHub account, so the request can be
+        # rejected even though this tap stayed under `min_remain_rate_limit`: another consumer
+        # drained the account in the meantime. Wait for the window to reset before retrying.
+        wait_for_rate_limit_reset(resp)
+        raise RateLimitExceeded(message) from None
 
     if error_code == 404 and should_skip_404:
         # Add not accessible stream into list.
@@ -167,24 +185,106 @@ def calculate_seconds(epoch):
     current = time.time()
     return max(0, int(ceil(epoch - current)))
 
+def log_rate_limit_headers(response, url):
+    """
+    Debug-log the rate limit headers of every response, so a sync log shows how the account's
+    quota (shared by every consumer of the GitHub account) evolves request by request.
+    """
+    values = {name: response.headers[name] for name in RATE_LIMIT_HEADERS if name in response.headers}
+    if not values:
+        LOGGER.debug("Rate limit: no rate limit headers in response (HTTP %s) for %s", response.status_code, url)
+        return
+    try:
+        values['seconds_until_reset'] = calculate_seconds(int(values['X-RateLimit-Reset']))
+    except (KeyError, ValueError):
+        pass
+    LOGGER.debug("Rate limit: %s (HTTP %s) for %s",
+                 ', '.join('{}={}'.format(name, value) for name, value in values.items()), response.status_code, url)
+
+def seconds_until_rate_limit_reset(response):
+    """
+    Seconds to wait for the primary rate limit window to reset, based on `X-RateLimit-Reset`.
+    Returns None when the header is absent.
+    """
+    if 'X-RateLimit-Reset' not in response.headers:
+        return None
+    return calculate_seconds(int(response.headers['X-RateLimit-Reset']) + RATE_LIMIT_RESET_MARGIN_SECONDS)
+
+def is_rate_limit_rejection(response, response_message=''):
+    """
+    Whether a non-200 response is GitHub rejecting the request because of a rate limit
+    (primary or secondary). GitHub answers with 403 or 429 in both cases.
+
+    The primary quota is per GitHub *account*, shared by every token / app of that account,
+    so a rejection can happen even when this tap never went under `min_remain_rate_limit`.
+    """
+    if response.status_code not in (403, 429):
+        return False
+    if 'Retry-After' in response.headers:
+        return True
+    if str(response.headers.get('X-RateLimit-Remaining', '')) == '0':
+        return True
+    return RATE_LIMIT_MSG_FRAGMENT in response_message.lower()
+
+def wait_for_rate_limit_reset(response):
+    """
+    Sleep until a *rejected* request can be retried: `Retry-After` for secondary limits,
+    `X-RateLimit-Reset` for the primary limit. The quota is already gone (possibly consumed by
+    another user of the same GitHub account), so `max_sleep_seconds` is not applied here: the
+    only alternative to waiting is failing the sync. The wait is capped at the length of a
+    rate-limit window; when no header is present nothing is slept here and the caller's backoff
+    applies GitHub's fallback guidance (retry after at least one minute).
+    """
+    if 'Retry-After' in response.headers:
+        seconds_to_sleep = int(response.headers['Retry-After'])
+        reason = "Secondary rate limit hit (Retry-After header)"
+    else:
+        seconds_to_sleep = seconds_until_rate_limit_reset(response)
+        reason = "Account rate limit exhausted (X-RateLimit-Remaining: {}, X-RateLimit-Limit: {})".format(
+            response.headers.get('X-RateLimit-Remaining'), response.headers.get('X-RateLimit-Limit'))
+
+    if not seconds_to_sleep:
+        return
+    seconds_to_sleep = min(seconds_to_sleep, RATE_LIMIT_WINDOW_SECONDS)
+    LOGGER.info("%s. Tap will retry the data collection after %s seconds.", reason, seconds_to_sleep)
+    time.sleep(seconds_to_sleep)
+
 def rate_throttling(response, max_sleep_seconds, min_remain_rate_limit, base_url=DEFAULT_DOMAIN):
     """
-    For rate limit errors, get the remaining time before retrying and calculate the time to sleep before making a new request.
+    Throttle after a successful request so the tap leaves at least `min_remain_rate_limit`
+    requests of the account's hourly quota untouched.
+
+    `X-RateLimit-Remaining` reports the quota left for the whole GitHub account (every token,
+    OAuth app or GitHub App acting as that user shares it), not only for this tap, so the
+    reserve is what other consumers of the account get to keep.
     """
     if "Retry-After" in response.headers:
         # handles the secondary rate limit
         seconds_to_sleep = int(response.headers['Retry-After'])
+        if seconds_to_sleep > max_sleep_seconds:
+            message = "Secondary rate limit exceeded, please try after {} seconds.".format(seconds_to_sleep)
+            raise RateLimitSleepExceeded(message) from None
         LOGGER.info("Retry-After header found in response. Tap will retry the data collection after %s seconds.", seconds_to_sleep)
         time.sleep(seconds_to_sleep)
     if 'X-RateLimit-Remaining' in response.headers:
-        if int(response.headers['X-RateLimit-Remaining']) <= min_remain_rate_limit:
-            seconds_to_sleep = calculate_seconds(int(response.headers['X-RateLimit-Reset']) + 15)
+        remaining = int(response.headers['X-RateLimit-Remaining'])
+        if remaining <= min_remain_rate_limit:
+            seconds_to_sleep = seconds_until_rate_limit_reset(response)
+            if seconds_to_sleep is None:
+                # Should not happen on github.com (the header is always sent) but follow GitHub's
+                # fallback guidance rather than keep consuming the shared quota.
+                LOGGER.warning("X-RateLimit-Remaining is %s but X-RateLimit-Reset header is missing, waiting %s seconds.",
+                               remaining, RATE_LIMIT_FALLBACK_WAIT_SECONDS)
+                seconds_to_sleep = RATE_LIMIT_FALLBACK_WAIT_SECONDS
 
             if seconds_to_sleep > max_sleep_seconds:
                 message = "API rate limit exceeded, please try after {} seconds.".format(seconds_to_sleep)
                 raise RateLimitSleepExceeded(message) from None
 
-            LOGGER.info("API rate limit exceeded. Tap will retry the data collection after %s seconds.", seconds_to_sleep)
+            LOGGER.info("Account rate limit reserve reached (X-RateLimit-Remaining: %s, X-RateLimit-Limit: %s, "
+                        "min_remain_rate_limit: %s). The quota is shared by every token of this GitHub account. "
+                        "Tap will retry the data collection after %s seconds.",
+                        remaining, response.headers.get('X-RateLimit-Limit'), min_remain_rate_limit, seconds_to_sleep)
             time.sleep(seconds_to_sleep)
     elif base_url == DEFAULT_DOMAIN:
         # On github.com a missing `X-RateLimit-Remaining` header means the base URL is not a
@@ -244,6 +344,7 @@ class GithubClient:
         with metrics.http_request_timer(url) as timer:
             self.session.headers.update(headers)
             resp = self.session.request(method='get', url=url, timeout=self.get_request_timeout())
+            log_rate_limit_headers(resp, url)
             if resp.status_code != 200:
                 raise_for_error(resp, source, stream, self, should_skip_404)
             timer.tags[metrics.Tag.http_status_code] = resp.status_code

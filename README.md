@@ -70,6 +70,26 @@ This tap:
 > Note: The max results per page is configurable with the parameter `max_per_page`,
 > as default it will return 100 (that is the max of most of the endpoints)
 
+### Rate limiting
+
+GitHub's primary rate limit (5,000 requests/hour, 15,000 for GitHub Enterprise Cloud users)
+is per **account**, not per token: every token, OAuth app or GitHub App acting as that
+account draws from the same hourly quota. The `X-RateLimit-Remaining` header the tap reads
+therefore reflects the whole account, including requests made by other tools with other tokens.
+
+- `min_remain_rate_limit` (default `0`): the tap stops and waits for the window to reset as
+  soon as the account's remaining quota reaches this value. This is the share of the hourly
+  quota left for every *other* consumer of the account, so when the token belongs to a shared
+  bot account set it well above `0` (e.g. `1000`); with `0` the tap is allowed to use the
+  whole quota and starve the other consumers.
+- `max_sleep_seconds` (default `600`): longest wait the tap accepts when it reaches
+  `min_remain_rate_limit` after a successful request. If the reset is further away the tap
+  fails with `RateLimitSleepExceeded` instead of sleeping. Set it above `3600` to always wait
+  for the next window.
+- When GitHub rejects a request outright (`403`/`429` with `X-RateLimit-Remaining: 0` or a
+  secondary rate limit `Retry-After`), typically because another consumer drained the account,
+  the tap waits for the reset regardless of `max_sleep_seconds` and retries.
+
 4. Run the tap in discovery mode to get properties.json file
 
     ```bash
