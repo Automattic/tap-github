@@ -82,13 +82,19 @@ therefore reflects the whole account, including requests made by other tools wit
   quota left for every *other* consumer of the account, so when the token belongs to a shared
   bot account set it well above `0` (e.g. `1000`); with `0` the tap is allowed to use the
   whole quota and starve the other consumers.
-- `max_sleep_seconds` (default `600`): longest wait the tap accepts when it reaches
-  `min_remain_rate_limit` after a successful request. If the reset is further away the tap
-  fails with `RateLimitSleepExceeded` instead of sleeping. Set it above `3600` to always wait
-  for the next window.
-- When GitHub rejects a request outright (`403`/`429` with `X-RateLimit-Remaining: 0` or a
-  secondary rate limit `Retry-After`), typically because another consumer drained the account,
-  the tap waits for the reset regardless of `max_sleep_seconds` and retries.
+- `max_sleep_seconds` (default `3700`): longest wait the tap accepts before failing with
+  `RateLimitSleepExceeded`, both when it reaches `min_remain_rate_limit` after a successful
+  request and when GitHub rejects a request. The default is slightly more than one rate limit
+  window (the wait is `X-RateLimit-Reset` plus a 15 second margin), so the tap always waits for
+  the next window; lower it to fail fast and let the scheduler retry from the bookmark.
+- When GitHub rejects a request outright (`403`/`429`), typically because another consumer
+  drained the account, the tap follows GitHub's guidance: wait `Retry-After` if present, else
+  wait for `X-RateLimit-Reset` when `X-RateLimit-Remaining` is `0`, else one minute. Then it
+  retries.
+- Every response's rate limit headers are logged at `DEBUG` level (`Rate limit: X-RateLimit-Limit=...`).
+  Singer logs at `INFO` by default; point `LOGGING_CONF_FILE` at a copy of singer-python's
+  `logging.conf` with `level=DEBUG` to see them. Since the values are account-wide, a jump in
+  `X-RateLimit-Used` between two consecutive tap requests is another consumer of the account.
 
 4. Run the tap in discovery mode to get properties.json file
 

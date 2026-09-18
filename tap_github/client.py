@@ -8,7 +8,10 @@ from singer import metrics
 from math import ceil
 
 LOGGER = singer.get_logger()
-DEFAULT_SLEEP_SECONDS = 600
+# Longest wait accepted before failing the sync with RateLimitSleepExceeded. Slightly more than
+# one rate limit window (plus the reset margin), so by default the tap waits for the reset both
+# when it reaches its reserve and when GitHub rejects a request; lower it to fail fast instead.
+DEFAULT_SLEEP_SECONDS = 3700
 DEFAULT_MIN_REMAIN_RATE_LIMIT = 0
 DEFAULT_MAX_PER_PAGE = 100
 DEFAULT_DOMAIN = "https://api.github.com"
@@ -147,7 +150,7 @@ def raise_for_error(resp, source, stream, client, should_skip_404):
         # The quota is shared by every token of the GitHub account, so the request can be
         # rejected even though this tap stayed under `min_remain_rate_limit`: another consumer
         # drained the account in the meantime. Wait for the window to reset before retrying.
-        wait_for_rate_limit_reset(resp)
+        wait_for_rate_limit_reset(resp, getattr(client, 'max_sleep_seconds', DEFAULT_SLEEP_SECONDS))
         raise RateLimitExceeded(message) from None
 
     if error_code == 404 and should_skip_404:
@@ -226,26 +229,32 @@ def is_rate_limit_rejection(response, response_message=''):
         return True
     return RATE_LIMIT_MSG_FRAGMENT in response_message.lower()
 
-def wait_for_rate_limit_reset(response):
+def wait_for_rate_limit_reset(response, max_sleep_seconds):
     """
-    Sleep until a *rejected* request can be retried: `Retry-After` for secondary limits,
-    `X-RateLimit-Reset` for the primary limit. The quota is already gone (possibly consumed by
-    another user of the same GitHub account), so `max_sleep_seconds` is not applied here: the
-    only alternative to waiting is failing the sync. The wait is capped at the length of a
-    rate-limit window; when no header is present nothing is slept here and the caller's backoff
-    applies GitHub's fallback guidance (retry after at least one minute).
+    Sleep until a *rejected* request can be retried, following GitHub's guidance in order:
+    `Retry-After` if present (secondary limit), else `X-RateLimit-Reset` when
+    `X-RateLimit-Remaining` is 0 (primary limit exhausted, possibly by another consumer of the
+    same GitHub account), else at least one minute (secondary limit without a hint).
+    The wait is capped at one rate limit window and, like the throttle after a successful
+    request, must not exceed `max_sleep_seconds` or the sync fails with RateLimitSleepExceeded.
     """
+    remaining = str(response.headers.get('X-RateLimit-Remaining', ''))
     if 'Retry-After' in response.headers:
         seconds_to_sleep = int(response.headers['Retry-After'])
         reason = "Secondary rate limit hit (Retry-After header)"
-    else:
+    elif remaining == '0' and 'X-RateLimit-Reset' in response.headers:
         seconds_to_sleep = seconds_until_rate_limit_reset(response)
-        reason = "Account rate limit exhausted (X-RateLimit-Remaining: {}, X-RateLimit-Limit: {})".format(
-            response.headers.get('X-RateLimit-Remaining'), response.headers.get('X-RateLimit-Limit'))
+        reason = "Account rate limit exhausted (X-RateLimit-Remaining: 0, X-RateLimit-Limit: {})".format(
+            response.headers.get('X-RateLimit-Limit'))
+    else:
+        seconds_to_sleep = RATE_LIMIT_FALLBACK_WAIT_SECONDS
+        reason = "Rate limit rejection without a wait hint (no Retry-After, X-RateLimit-Remaining: {})".format(
+            remaining or 'missing')
 
-    if not seconds_to_sleep:
-        return
     seconds_to_sleep = min(seconds_to_sleep, RATE_LIMIT_WINDOW_SECONDS)
+    if seconds_to_sleep > max_sleep_seconds:
+        message = "{}, please try after {} seconds.".format(reason, seconds_to_sleep)
+        raise RateLimitSleepExceeded(message) from None
     LOGGER.info("%s. Tap will retry the data collection after %s seconds.", reason, seconds_to_sleep)
     time.sleep(seconds_to_sleep)
 
@@ -336,7 +345,9 @@ class GithubClient:
     @backoff.on_exception(backoff.expo, (requests.Timeout, requests.ConnectionError, Server5xxError, TooManyRequests),
                           max_tries=5, factor=2)
     @backoff.on_exception(backoff.expo, (BadCredentialsException, ), max_tries=3, factor=2)
-    @backoff.on_exception(backoff.constant, (RateLimitExceeded, ), interval=60, jitter=None, max_time=RATE_LIMIT_RETRY_MAX_TIME)
+    # The wait for a rate limit rejection is done in `wait_for_rate_limit_reset` (it needs the
+    # response headers), so the retry itself adds no extra delay.
+    @backoff.on_exception(backoff.constant, (RateLimitExceeded, ), interval=0, jitter=None, max_time=RATE_LIMIT_RETRY_MAX_TIME)
     def authed_get_single_page(self, source, url, headers={}, stream="", should_skip_404 = True):
         """
         Call rest API and return the response in case of status code 200.

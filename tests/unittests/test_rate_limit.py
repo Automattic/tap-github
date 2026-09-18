@@ -139,10 +139,11 @@ class TestLogRateLimitHeaders(unittest.TestCase):
     Test the per-response debug log of the rate limit headers.
     """
 
+    @mock.patch("time.time", return_value=1_000_000.0)
     @mock.patch("tap_github.client.LOGGER.debug")
-    def test_logs_all_headers_and_seconds_until_reset(self, mocked_debug):
+    def test_logs_all_headers_and_seconds_until_reset(self, mocked_debug, _mocked_time):
         resp = make_response(200, headers={"X-RateLimit-Limit": 5000, "X-RateLimit-Remaining": 291, "X-RateLimit-Used": 4709,
-                                           "X-RateLimit-Reset": reset_in(120), "X-RateLimit-Resource": "core"})
+                                           "X-RateLimit-Reset": 1_000_120, "X-RateLimit-Resource": "core"})
 
         tap_github.client.log_rate_limit_headers(resp, "https://api.github.com/repos/org/repo/commits")
 
@@ -151,7 +152,7 @@ class TestLogRateLimitHeaders(unittest.TestCase):
         self.assertIn("X-RateLimit-Remaining=291", message)
         self.assertIn("X-RateLimit-Used=4709", message)
         self.assertIn("X-RateLimit-Resource=core", message)
-        self.assertIn("seconds_until_reset=12", message)
+        self.assertIn("seconds_until_reset=120 (HTTP 200)", message)
         self.assertIn("(HTTP 200) for https://api.github.com/repos/org/repo/commits", message)
         self.assertNotIn("Retry-After", message)
 
@@ -211,24 +212,42 @@ class TestWaitForRateLimitReset(unittest.TestCase):
     Test the wait applied after a rejected request.
     """
 
-    def test_waits_until_reset(self, mocked_sleep):
+    MAX_SLEEP = 4000
+
+    def test_primary_exhausted_waits_until_reset(self, mocked_sleep):
         resp = make_response(403, headers={"X-RateLimit-Remaining": 0, "X-RateLimit-Reset": reset_in(2000)})
-        wait_for_rate_limit_reset(resp)
+        wait_for_rate_limit_reset(resp, self.MAX_SLEEP)
         mocked_sleep.assert_called_with(2000 + RATE_LIMIT_RESET_MARGIN_SECONDS + 1)
 
     def test_prefers_retry_after(self, mocked_sleep):
         resp = make_response(429, headers={"Retry-After": 45, "X-RateLimit-Remaining": 0, "X-RateLimit-Reset": reset_in(2000)})
-        wait_for_rate_limit_reset(resp)
+        wait_for_rate_limit_reset(resp, self.MAX_SLEEP)
         mocked_sleep.assert_called_with(45)
+
+    def test_secondary_without_retry_after_waits_one_minute_not_primary_reset(self, mocked_sleep):
+        """
+        Secondary rate limit rejection: no `Retry-After`, quota still available. Must not sleep
+        until the primary reset (50 minutes away here) but follow the one-minute fallback.
+        """
+        resp = make_response(403, headers={"X-RateLimit-Remaining": 4000, "X-RateLimit-Reset": reset_in(3000)})
+        wait_for_rate_limit_reset(resp, self.MAX_SLEEP)
+        mocked_sleep.assert_called_with(RATE_LIMIT_FALLBACK_WAIT_SECONDS)
 
     def test_wait_capped_to_one_window(self, mocked_sleep):
         resp = make_response(403, headers={"X-RateLimit-Remaining": 0, "X-RateLimit-Reset": reset_in(10 * 3600)})
-        wait_for_rate_limit_reset(resp)
+        wait_for_rate_limit_reset(resp, self.MAX_SLEEP)
         mocked_sleep.assert_called_with(RATE_LIMIT_WINDOW_SECONDS)
 
-    def test_no_headers_no_sleep(self, mocked_sleep):
+    def test_no_headers_waits_one_minute(self, mocked_sleep):
         resp = make_response(403, headers={})
-        wait_for_rate_limit_reset(resp)
+        wait_for_rate_limit_reset(resp, self.MAX_SLEEP)
+        mocked_sleep.assert_called_with(RATE_LIMIT_FALLBACK_WAIT_SECONDS)
+
+    def test_wait_above_max_sleep_seconds_raises(self, mocked_sleep):
+        resp = make_response(403, headers={"X-RateLimit-Remaining": 0, "X-RateLimit-Reset": reset_in(2000)})
+        with self.assertRaises(RateLimitSleepExceeded) as e:
+            wait_for_rate_limit_reset(resp, max_sleep_seconds=600)
+        self.assertIn("please try after {} seconds.".format(2000 + RATE_LIMIT_RESET_MARGIN_SECONDS + 1), str(e.exception))
         self.assertFalse(mocked_sleep.called)
 
 
@@ -260,9 +279,20 @@ class TestRateLimitRejectionInClient(unittest.TestCase):
 
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(mocked_request.call_count, 2)
-        # Slept until the window reset (+ margin) even though the wait exceeds max_sleep_seconds:
-        # the quota is already gone, waiting is the only way forward.
+        # Slept until the window reset (+ margin), within the default max_sleep_seconds.
         self.assertIn(mock.call(1200 + RATE_LIMIT_RESET_MARGIN_SECONDS + 1), mocked_sleep.mock_calls)
+        # The retry itself adds no extra delay on top of that wait.
+        self.assertEqual([c for c in mocked_sleep.mock_calls if c != mock.call(0)],
+                         [mock.call(1200 + RATE_LIMIT_RESET_MARGIN_SECONDS + 1)])
+
+    def test_rejection_beyond_max_sleep_seconds_fails_without_retry(self, mocked_request, mocked_sleep):
+        mocked_request.return_value = self._rejected(403, {"X-RateLimit-Remaining": 0, "X-RateLimit-Reset": reset_in(1200)},
+                                                     "API rate limit exceeded for user ID 12345.")
+
+        with self.assertRaises(RateLimitSleepExceeded):
+            GithubClient({**self.config, "max_sleep_seconds": 600}).authed_get_single_page("", "")
+        self.assertEqual(mocked_request.call_count, 1)
+        self.assertFalse(mocked_sleep.called)
 
     def test_429_primary_limit_is_retried_as_rate_limit(self, mocked_request, mocked_sleep):
         mocked_request.side_effect = [
